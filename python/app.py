@@ -1,32 +1,76 @@
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
-from flask_migrate import Migrate
-from flask_sqlalchemy import SQLAlchemy
-from models import db, Product, User, Cart
 from flask_cors import CORS
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
+from flask_migrate import Migrate
+from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
-from models import db, User, Product, Cart
+
+from database import db
+from models import User, Product, Cart
+
+_backend_dir = Path(__file__).resolve().parent
+load_dotenv(_backend_dir / '.env')
+load_dotenv(_backend_dir.parent / '.env')
 
 app = Flask(__name__)
 CORS(app)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///../instance/products.db'
+jwt_secret = os.environ.get('JWT_SECRET_KEY')
+if not jwt_secret:
+    raise RuntimeError(
+        'JWT_SECRET_KEY environment variable is required. '
+        'Copy .env.example to .env and set a long random value.'
+    )
+
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
+    'DATABASE_URL',
+    'sqlite:///../instance/products.db'
+)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = '8369a00156590593b430006a34c9944cd2f07ecbdd1caa53d259853b03fffc2dd092aa1be3c7d782efbd88949d036e1af71dbd16aba51dd308df632fb82d0632fa6a35163077ec8e3f7db1321d9dad6de5cf29a73c490a74da6f1fd14579100dc8f1e05f5003d0339739e8e2780bdeb8391d5581545da4f96cac6903c188e248309f8b67ea0ead3dc076ac02aea0ca727bae0f453f60e00f1cbe1c4e13be7d959ab041a8fb4bc5ff5e0756e70dc25a2c5dbb0f03a7d1914424a6136b51e4956ed5b4c600e8c782ae7317a9ae04d42188c4372c9816c08ec3b7f547c20cf3217188ea79a830caaa9dae4acfb628b422cd6c3522feb1d9365a8529de768cc18082'
+app.config['JWT_SECRET_KEY'] = jwt_secret
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', jwt_secret)
 
 db.init_app(app)
-migrate = Migrate(app, db)
+migrate = Migrate(
+    app,
+    db,
+    directory=os.path.join(_backend_dir, 'migrations'),
+    render_as_batch=True,
+)
 jwt = JWTManager(app)
+
+
+def get_current_user_id():
+    """Return the authenticated user id as an int (JWT sub may be a string)."""
+    return int(get_jwt_identity())
+
+
+def _json_body():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return None
+    return data
+
 
 # User Registration
 @app.route('/register', methods=['POST'])
 def register():
-    data = request.get_json()
-    username = data.get('username')
+    data = _json_body()
+    if not data:
+        return jsonify({'message': 'Request body must be JSON'}), 400
+
+    username = (data.get('username') or '').strip()
     password = data.get('password')
-    email = data.get('email')
+    email = (data.get('email') or '').strip()
+
+    if not username or not password or not email:
+        return jsonify({'message': 'Username, email, and password are required'}), 400
 
     if User.query.filter_by(username=username).first():
         return jsonify({'message': 'Username already taken'}), 400
@@ -38,7 +82,11 @@ def register():
     new_user = User(username=username, password=hashed_password, email=email)
 
     db.session.add(new_user)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({'message': 'Username or email already exists'}), 400
 
     return jsonify({'message': 'User registered successfully'}), 201
 
@@ -46,16 +94,22 @@ def register():
 # User Login
 @app.route('/login', methods=['POST'])
 def login():
-    data = request.get_json()
+    data = _json_body()
+    if not data:
+        return jsonify({'message': 'Request body must be JSON'}), 400
+
     username = data.get('username')
     password = data.get('password')
+
+    if not username or not password:
+        return jsonify({'message': 'Invalid credentials'}), 401
 
     user = User.query.filter_by(username=username).first()
 
     if not user or not check_password_hash(user.password, password):
         return jsonify({'message': 'Invalid credentials'}), 401
 
-    access_token = create_access_token(identity=user.user_id)
+    access_token = create_access_token(identity=str(user.user_id))
     return jsonify({
         'access_token': access_token,
         'user': {
@@ -63,14 +117,15 @@ def login():
             'email': user.email
         }
     }), 200
-    
+
 
 # Protected Route Example
 @app.route('/', methods=['GET'])
 @jwt_required()
 def protected():
-    current_user_id = get_jwt_identity()
-    user = User.query.get(current_user_id)
+    user = db.session.get(User, get_current_user_id())
+    if user is None:
+        return jsonify({'message': 'User not found'}), 401
     return jsonify({'message': f'Hello {user.username}, this is a protected route!'}), 200
 
 
@@ -81,7 +136,7 @@ def home():
 @app.route('/api/user/products', methods=['GET'])
 @jwt_required()
 def get_user_products():
-    user_id = get_jwt_identity()
+    user_id = get_current_user_id()
     products = Product.query.filter_by(user_id=user_id).all()
     return jsonify([product.to_dict() for product in products]), 200
  # GET all products (public)
@@ -94,8 +149,10 @@ def get_products():
 @app.route('/api/products', methods=['POST'])
 @jwt_required()
 def create_product():
-    user_id = get_jwt_identity()
-    data = request.get_json()
+    user_id = get_current_user_id()
+    data = _json_body()
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
 
     if not all(key in data for key in ['name', 'price', 'category']):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -117,13 +174,18 @@ def create_product():
 @app.route('/api/products/<int:product_id>', methods=['PUT'])
 @jwt_required()
 def update_product(product_id):
-    user_id = get_jwt_identity()
-    product = Product.query.get_or_404(product_id)
+    user_id = get_current_user_id()
+    product = db.session.get(Product, product_id)
+    if product is None:
+        return jsonify({'error': 'Product not found'}), 404
 
     if product.user_id != user_id:
         return jsonify({'error': 'Unauthorized access'}), 403
 
-    data = request.get_json()
+    data = _json_body()
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
+
     product.name = data.get('name', product.name)
     product.price = data.get('price', product.price)
     product.description = data.get('description', product.description)
@@ -137,8 +199,10 @@ def update_product(product_id):
 @app.route('/api/products/<int:product_id>', methods=['DELETE'])
 @jwt_required()
 def delete_product(product_id):
-    user_id = get_jwt_identity()
-    product = Product.query.get_or_404(product_id)
+    user_id = get_current_user_id()
+    product = db.session.get(Product, product_id)
+    if product is None:
+        return jsonify({'error': 'Product not found'}), 404
 
     if product.user_id != user_id:
         return jsonify({'error': 'Unauthorized access'}), 403
@@ -146,8 +210,9 @@ def delete_product(product_id):
     db.session.delete(product)
     db.session.commit()
     return jsonify({'message': 'Product deleted'}), 200
-# GET all users (public)
+# GET all users (authenticated)
 @app.route('/api/users', methods=['GET'])
+@jwt_required()
 def get_users():
     users = User.query.all()
     return jsonify([user.to_dict() for user in users]), 200
@@ -156,19 +221,35 @@ def get_users():
 # POST create a new user (registration)
 @app.route('/api/users', methods=['POST'])
 def create_user():
-    data = request.get_json()
+    data = _json_body()
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
 
     if not all(key in data for key in ['username', 'password', 'email']):
         return jsonify({'error': 'Missing required fields'}), 400
 
-    if User.query.filter_by(email=data['email']).first():
+    username = (data.get('username') or '').strip()
+    password = data.get('password')
+    email = (data.get('email') or '').strip()
+
+    if not username or not password or not email:
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    if User.query.filter_by(username=username).first():
+        return jsonify({'error': 'Username already taken'}), 400
+
+    if User.query.filter_by(email=email).first():
         return jsonify({'error': 'Email already exists'}), 400
 
-    hashed_password = generate_password_hash(data['password'])
-    new_user = User(username=data['username'], password=hashed_password, email=data['email'])
+    hashed_password = generate_password_hash(password)
+    new_user = User(username=username, password=hashed_password, email=email)
 
     db.session.add(new_user)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({'error': 'Username or email already exists'}), 400
 
     return jsonify({'message': 'User created successfully', 'user': new_user.to_dict()}), 201
 
@@ -177,13 +258,17 @@ def create_user():
 @app.route('/api/cart', methods=['POST'])
 @jwt_required()
 def add_to_cart():
-    user_id = get_jwt_identity()
-    data = request.get_json()
+    user_id = get_current_user_id()
+    data = _json_body()
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
 
     if 'product_id' not in data or 'quantity' not in data:
         return jsonify({'error': 'Missing required fields'}), 400
 
-    product = Product.query.get_or_404(data['product_id'])
+    product = db.session.get(Product, data['product_id'])
+    if product is None:
+        return jsonify({'error': 'Product not found'}), 404
 
     cart_item = Cart.query.filter_by(user_id=user_id, product_id=product.product_id).first()
     if cart_item:
@@ -200,7 +285,7 @@ def add_to_cart():
 @app.route('/api/cart', methods=['GET'])
 @jwt_required()
 def view_cart():
-    user_id = get_jwt_identity()
+    user_id = get_current_user_id()
     cart_items = Cart.query.filter_by(user_id=user_id).all()
     return jsonify([{
         'product_id': item.product_id,
@@ -212,12 +297,17 @@ def view_cart():
 @app.route('/api/cart/<int:product_id>', methods=['DELETE'])
 @jwt_required()
 def delete_cart_item(product_id):
-    user_id = get_jwt_identity()
-    cart_item = Cart.query.filter_by(user_id=user_id, product_id=product_id).first_or_404()
+    user_id = get_current_user_id()
+    cart_item = Cart.query.filter_by(user_id=user_id, product_id=product_id).first()
+    if cart_item is None:
+        return jsonify({'error': 'Cart item not found'}), 404
 
     db.session.delete(cart_item)
     db.session.commit()
     return jsonify({'message': 'Cart item deleted'}), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    host = os.environ.get('FLASK_HOST', '127.0.0.1')
+    port = int(os.environ.get('FLASK_PORT', '5000'))
+    app.run(host=host, port=port, debug=debug)
