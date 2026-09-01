@@ -13,6 +13,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from database import db
 from models import User, Product, Cart
+from settings import resolve_jwt_secret
 
 _backend_dir = Path(__file__).resolve().parent
 load_dotenv(_backend_dir / '.env')
@@ -21,12 +22,7 @@ load_dotenv(_backend_dir.parent / '.env')
 app = Flask(__name__)
 CORS(app)
 
-jwt_secret = os.environ.get('JWT_SECRET_KEY')
-if not jwt_secret:
-    raise RuntimeError(
-        'JWT_SECRET_KEY environment variable is required. '
-        'Copy .env.example to .env and set a long random value.'
-    )
+jwt_secret = resolve_jwt_secret()
 
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
     'DATABASE_URL',
