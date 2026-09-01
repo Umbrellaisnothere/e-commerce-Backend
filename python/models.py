@@ -48,3 +48,11 @@ class Cart(db.Model):
 
     user = db.relationship('User', backref='carts')
     product = db.relationship('Product', backref='carts')
+
+
+class TokenBlocklist(db.Model):
+    __tablename__ = 'token_blocklist'
+    id = db.Column(db.Integer, primary_key=True)
+    jti = db.Column(db.String(36), nullable=False, unique=True, index=True)
+    revoked_at = db.Column(db.DateTime, nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)

@@ -1,18 +1,19 @@
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_jwt_extended import (
-    JWTManager, create_access_token, jwt_required, get_jwt_identity
+    JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt
 )
 from flask_migrate import Migrate
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from database import db
-from models import User, Product, Cart
+from models import User, Product, Cart, TokenBlocklist
 from settings import resolve_jwt_secret
 
 _backend_dir = Path(__file__).resolve().parent
@@ -40,6 +41,17 @@ migrate = Migrate(
     render_as_batch=True,
 )
 jwt = JWTManager(app)
+
+
+@jwt.token_in_blocklist_loader
+def token_is_revoked(jwt_header, jwt_payload):
+    jti = jwt_payload.get('jti')
+    if not jti:
+        return False
+    return (
+        db.session.query(TokenBlocklist.id).filter_by(jti=jti).first()
+        is not None
+    )
 
 
 def get_current_user_id():
@@ -113,6 +125,27 @@ def login():
             'email': user.email
         }
     }), 200
+
+
+@app.route('/logout', methods=['POST'])
+@jwt_required()
+def logout():
+    claims = get_jwt()
+    jti = claims['jti']
+    exp = claims['exp']
+    if TokenBlocklist.query.filter_by(jti=jti).first() is None:
+        revoked_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        expires_at = datetime.fromtimestamp(exp, tz=timezone.utc).replace(tzinfo=None)
+        db.session.add(TokenBlocklist(
+            jti=jti,
+            revoked_at=revoked_at,
+            expires_at=expires_at,
+        ))
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+    return jsonify({'message': 'Logged out'}), 200
 
 
 # Protected Route Example
