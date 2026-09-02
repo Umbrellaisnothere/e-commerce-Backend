@@ -239,12 +239,6 @@ def delete_product(product_id):
     db.session.delete(product)
     db.session.commit()
     return jsonify({'message': 'Product deleted'}), 200
-# GET all users (authenticated)
-@app.route('/api/users', methods=['GET'])
-@jwt_required()
-def get_users():
-    users = User.query.all()
-    return jsonify([user.to_dict() for user in users]), 200
 
 
 # POST create a new user (registration)
