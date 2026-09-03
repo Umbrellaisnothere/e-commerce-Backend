@@ -99,6 +99,7 @@ def _run_seed(db_path, extra_env=None):
     env = os.environ.copy()
     env['FLASK_ENV'] = 'development'
     env['JWT_SECRET_KEY'] = 'a' * 32
+    env['CORS_ORIGINS'] = 'http://localhost:3000'
     env['DATABASE_URL'] = f'sqlite:///{db_path}'
     env['PYTHONPATH'] = str(BACKEND_DIR)
     if extra_env:
@@ -130,6 +131,7 @@ def test_subprocess_rejects_production_seed(tmp_path):
     env['FLASK_ENV'] = 'production'
     env['SEED_ALLOW'] = '1'
     env['JWT_SECRET_KEY'] = 'a' * 32
+    env['CORS_ORIGINS'] = 'http://localhost:3000'
     env['DATABASE_URL'] = f'sqlite:///{db_path}'
     env['PYTHONPATH'] = str(BACKEND_DIR)
     result = subprocess.run(

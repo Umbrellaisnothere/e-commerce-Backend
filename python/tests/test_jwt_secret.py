@@ -80,6 +80,7 @@ def test_app_import_fails_without_secret():
     env = os.environ.copy()
     env.pop('JWT_SECRET_KEY', None)
     env.pop('SECRET_KEY', None)
+    env['CORS_ORIGINS'] = 'http://localhost:3000'
     env['FLASK_ENV'] = 'production'
     env['PYTHONPATH'] = str(BACKEND_DIR)
     result = subprocess.run(

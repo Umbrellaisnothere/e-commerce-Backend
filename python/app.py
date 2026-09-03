@@ -14,16 +14,15 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from database import db
 from models import User, Product, Cart, TokenBlocklist
-from settings import resolve_jwt_secret
+from settings import flask_cors_kwargs, resolve_cors_origins, resolve_jwt_secret
 
 _backend_dir = Path(__file__).resolve().parent
 load_dotenv(_backend_dir / '.env')
 load_dotenv(_backend_dir.parent / '.env')
 
 app = Flask(__name__)
-CORS(app)
-
 jwt_secret = resolve_jwt_secret()
+CORS(app, **flask_cors_kwargs(resolve_cors_origins()))
 
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
     'DATABASE_URL',

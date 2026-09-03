@@ -4,6 +4,7 @@ import pytest
 
 os.environ.setdefault('JWT_SECRET_KEY', 'a' * 32)
 os.environ.setdefault('FLASK_ENV', 'development')
+os.environ.setdefault('CORS_ORIGINS', 'http://localhost:3000')
 
 from app import app, db
 from models import User

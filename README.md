@@ -2,12 +2,13 @@
 
 ## Environment
 
-Copy `.env.example` to `.env` and set secrets. The API will not start without `JWT_SECRET_KEY`.
+Copy `.env.example` to `.env` and set secrets. The API will not start without `JWT_SECRET_KEY` and `CORS_ORIGINS`.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `JWT_SECRET_KEY` | Yes | none | Signs access tokens. Use a long random value. Production requires 32+ characters. Placeholder values are rejected. |
 | `SECRET_KEY` | No | same as `JWT_SECRET_KEY` | Flask session signing. |
+| `CORS_ORIGINS` | Yes | none | Comma-separated frontend origins allowed by CORS. Must include scheme and host (and port if not default). Do not include a trailing `/`. `*` is not permitted. Missing/blank values fail closed in development and production; there is no localhost fallback. |
 | `FLASK_ENV` | No | treated as production if unset | `development` required for `seed.py` and relaxes JWT secret length. Unset/`production` is fail-closed. |
 | `SEED_PASSWORD_ANGEL` | No | generated if unset | Local seed password for `Angel`. Never commit a real value. |
 | `SEED_PASSWORD_MITCHELLE` | No | generated if unset | Local seed password for `Mitchelle`. Never commit a real value. |
@@ -15,6 +16,24 @@ Copy `.env.example` to `.env` and set secrets. The API will not start without `J
 | `FLASK_DEBUG` | No | `0` | Set to `1` only for local debugging. |
 | `FLASK_HOST` | No | `127.0.0.1` | Dev server bind address. |
 | `FLASK_PORT` | No | `5000` | Dev server port. |
+
+### CORS origins
+
+`CORS_ORIGINS` is an explicit allowlist. Browser requests from any other origin are not granted CORS access. Vercel preview deployments (`https://*.vercel.app`) are not automatically allowed.
+
+Development:
+
+```text
+CORS_ORIGINS=http://localhost:3000
+```
+
+Production:
+
+```text
+CORS_ORIGINS=https://e-commerce-chi-one-94.vercel.app,https://e-commerce-va1l.vercel.app
+```
+
+Do not use `http://localhost:5173` or `http://127.0.0.1:3000` unless that origin is later added on purpose. JWT remains `Authorization: Bearer`; `Access-Control-Allow-Credentials` is not enabled.
 
 From `python/`:
 
