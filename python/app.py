@@ -8,13 +8,21 @@ from flask_cors import CORS
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt
 )
+from flask_limiter import Limiter
+from flask_limiter.errors import RateLimitExceeded
+from flask_limiter.util import get_remote_address
 from flask_migrate import Migrate
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from database import db
 from models import User, Product, Cart, TokenBlocklist
-from settings import flask_cors_kwargs, resolve_cors_origins, resolve_jwt_secret
+from settings import (
+    flask_cors_kwargs,
+    normalize_rate_limit_username,
+    resolve_cors_origins,
+    resolve_jwt_secret,
+)
 
 _backend_dir = Path(__file__).resolve().parent
 load_dotenv(_backend_dir / '.env')
@@ -23,6 +31,23 @@ load_dotenv(_backend_dir.parent / '.env')
 app = Flask(__name__)
 jwt_secret = resolve_jwt_secret()
 CORS(app, **flask_cors_kwargs(resolve_cors_origins()))
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri='memory://',
+    strategy='fixed-window',
+    swallow_errors=False,
+)
+
+LOGIN_RATE_LIMIT = '10 per minute'
+REGISTRATION_RATE_LIMIT = '5 per hour'
+_registration_ip_limit = limiter.shared_limit(
+    REGISTRATION_RATE_LIMIT,
+    scope='registration',
+    key_func=get_remote_address,
+)
 
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
     'DATABASE_URL',
@@ -65,8 +90,23 @@ def _json_body():
     return data
 
 
+def login_username_key():
+    """Rate-limit key for login attempts. Never includes the password."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return normalize_rate_limit_username('')
+    return normalize_rate_limit_username(data.get('username'))
+
+
+@app.errorhandler(429)
+@app.errorhandler(RateLimitExceeded)
+def too_many_requests(exc):
+    return jsonify({'error': 'Too many requests'}), 429
+
+
 # User Registration
 @app.route('/register', methods=['POST'])
+@_registration_ip_limit
 def register():
     data = _json_body()
     if not data:
@@ -100,6 +140,8 @@ def register():
 
 # User Login
 @app.route('/login', methods=['POST'])
+@limiter.limit(LOGIN_RATE_LIMIT, key_func=get_remote_address)
+@limiter.limit(LOGIN_RATE_LIMIT, key_func=login_username_key)
 def login():
     data = _json_body()
     if not data:
@@ -242,6 +284,7 @@ def delete_product(product_id):
 
 # POST create a new user (registration)
 @app.route('/api/users', methods=['POST'])
+@_registration_ip_limit
 def create_user():
     data = _json_body()
     if not data:

@@ -35,6 +35,15 @@ CORS_ORIGINS=https://e-commerce-chi-one-94.vercel.app,https://e-commerce-va1l.ve
 
 Do not use `http://localhost:5173` or `http://127.0.0.1:3000` unless that origin is later added on purpose. JWT remains `Authorization: Bearer`; `Access-Control-Allow-Credentials` is not enabled.
 
+### Rate limiting
+
+Unauthenticated login and registration are rate limited in memory (single-process). Limits use `request.remote_addr` only; forwarding headers are not trusted.
+
+* `POST /login`: 10 requests per minute per IP, and 10 requests per minute per normalized username (stripped, lowercased). All attempts count, including failures.
+* `POST /register` and `POST /api/users`: 5 requests per hour per IP, shared across both routes.
+
+Exceeding a limit returns HTTP `429` with `{"error": "Too many requests"}`. Other routes are not rate limited.
+
 From `python/`:
 
 ```bash

@@ -144,3 +144,13 @@ def flask_cors_kwargs(origins):
         'supports_credentials': False,
         'send_wildcard': False,
     }
+
+
+def normalize_rate_limit_username(value):
+    """Normalize a login username for rate-limit keys only.
+
+    Does not change authentication or database lookup semantics.
+    """
+    if value is None:
+        return ''
+    return str(value).strip().lower()
