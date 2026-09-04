@@ -104,6 +104,45 @@ def too_many_requests(exc):
     return jsonify({'error': 'Too many requests'}), 429
 
 
+# Unauthenticated endpoints that still return credentials or account data.
+# JWT-protected views are detected separately from @jwt_required().
+_UNAUTHENTICATED_NO_STORE_ENDPOINTS = frozenset({
+    'login',
+    'register',
+    'create_user',
+})
+
+
+def _endpoint_requires_jwt(endpoint):
+    """True if the matched view is wrapped with @jwt_required()."""
+    func = app.view_functions.get(endpoint)
+    seen = set()
+    while func is not None and id(func) not in seen:
+        seen.add(id(func))
+        names = getattr(getattr(func, '__code__', None), 'co_names', ())
+        if 'verify_jwt_in_request' in names:
+            return True
+        func = getattr(func, '__wrapped__', None)
+    return False
+
+
+def _should_disable_store(req):
+    """Explicit no-store policy for auth and JWT-protected responses."""
+    endpoint = req.endpoint
+    if endpoint in _UNAUTHENTICATED_NO_STORE_ENDPOINTS:
+        return True
+    return _endpoint_requires_jwt(endpoint)
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    if _should_disable_store(request):
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
 # User Registration
 @app.route('/register', methods=['POST'])
 @_registration_ip_limit

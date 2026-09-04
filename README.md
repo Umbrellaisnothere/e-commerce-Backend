@@ -44,6 +44,10 @@ Unauthenticated login and registration are rate limited in memory (single-proces
 
 Exceeding a limit returns HTTP `429` with `{"error": "Too many requests"}`. Other routes are not rate limited.
 
+### Security headers
+
+Every response includes `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`. Sensitive auth and JWT-protected responses also send `Cache-Control: no-store`. Public `GET /api/products` is left cacheable. JWT remains `Authorization: Bearer` (no cookies).
+
 From `python/`:
 
 ```bash
