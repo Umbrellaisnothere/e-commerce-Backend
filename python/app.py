@@ -1,3 +1,4 @@
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
 from flask_migrate import Migrate
 from sqlalchemy.exc import IntegrityError
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from database import db
@@ -43,6 +45,8 @@ limiter = Limiter(
 
 LOGIN_RATE_LIMIT = '10 per minute'
 REGISTRATION_RATE_LIMIT = '5 per hour'
+MAX_CART_QUANTITY = 1000
+MAX_CONTENT_LENGTH = 256 * 1024
 _registration_ip_limit = limiter.shared_limit(
     REGISTRATION_RATE_LIMIT,
     scope='registration',
@@ -56,6 +60,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = jwt_secret
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', jwt_secret)
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 db.init_app(app)
 migrate = Migrate(
@@ -90,6 +95,53 @@ def _json_body():
     return data
 
 
+def _invalid_field(field):
+    return jsonify({'error': f'Invalid {field}'}), 400
+
+
+def _is_json_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_json_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_valid_quantity(value):
+    return _is_json_int(value) and 1 <= value <= MAX_CART_QUANTITY
+
+
+def _is_valid_price(value):
+    if not _is_json_number(value):
+        return False
+    if not math.isfinite(value):
+        return False
+    return value >= 0
+
+
+def _reject_non_string(value, field):
+    """Return a 400 response unless value is a JSON string."""
+    if not isinstance(value, str):
+        return _invalid_field(field)
+    return None
+
+
+def _reject_non_string_if_present(data, field):
+    """If the field is present, it must be a JSON string (null is invalid)."""
+    if field not in data:
+        return None
+    return _reject_non_string(data[field], field)
+
+
+def _optional_string(data, field, default=''):
+    if field not in data:
+        return default, None
+    err = _reject_non_string(data[field], field)
+    if err:
+        return None, err
+    return data[field], None
+
+
 def login_username_key():
     """Rate-limit key for login attempts. Never includes the password."""
     data = request.get_json(silent=True)
@@ -102,6 +154,12 @@ def login_username_key():
 @app.errorhandler(RateLimitExceeded)
 def too_many_requests(exc):
     return jsonify({'error': 'Too many requests'}), 429
+
+
+@app.errorhandler(413)
+@app.errorhandler(RequestEntityTooLarge)
+def request_too_large(exc):
+    return jsonify({'error': 'Request too large'}), 413
 
 
 # Unauthenticated endpoints that still return credentials or account data.
@@ -151,6 +209,11 @@ def register():
     if not data:
         return jsonify({'message': 'Request body must be JSON'}), 400
 
+    for field in ('username', 'password', 'email'):
+        err = _reject_non_string_if_present(data, field)
+        if err:
+            return err
+
     username = (data.get('username') or '').strip()
     password = data.get('password')
     email = (data.get('email') or '').strip()
@@ -188,6 +251,10 @@ def login():
 
     username = data.get('username')
     password = data.get('password')
+    for field in ('username', 'password'):
+        err = _reject_non_string_if_present(data, field)
+        if err:
+            return err
 
     if not username or not password:
         return jsonify({'message': 'Invalid credentials'}), 401
@@ -266,13 +333,28 @@ def create_product():
     if not all(key in data for key in ['name', 'price', 'category']):
         return jsonify({'error': 'Missing required fields'}), 400
 
+    err = _reject_non_string(data['name'], 'name')
+    if err:
+        return err
+    err = _reject_non_string(data['category'], 'category')
+    if err:
+        return err
+    description, err = _optional_string(data, 'description')
+    if err:
+        return err
+    photo_url, err = _optional_string(data, 'photo_url')
+    if err:
+        return err
+    if not _is_valid_price(data['price']):
+        return jsonify({'error': 'Invalid price'}), 400
+
     new_product = Product(
         user_id=user_id,
         name=data['name'],
         price=data['price'],
         category=data['category'],
-        description=data.get('description', ''),
-        photo_url=data.get('photo_url', '')
+        description=description,
+        photo_url=photo_url,
     )
     db.session.add(new_product)
     db.session.commit()
@@ -295,11 +377,30 @@ def update_product(product_id):
     if not data:
         return jsonify({'error': 'Request body must be JSON'}), 400
 
-    product.name = data.get('name', product.name)
-    product.price = data.get('price', product.price)
-    product.description = data.get('description', product.description)
-    product.category = data.get('category', product.category)
-    product.photo_url = data.get('photo_url', product.photo_url)
+    if 'name' in data:
+        err = _reject_non_string(data['name'], 'name')
+        if err:
+            return err
+        product.name = data['name']
+    if 'description' in data:
+        err = _reject_non_string(data['description'], 'description')
+        if err:
+            return err
+        product.description = data['description']
+    if 'price' in data:
+        if not _is_valid_price(data['price']):
+            return jsonify({'error': 'Invalid price'}), 400
+        product.price = data['price']
+    if 'category' in data:
+        err = _reject_non_string(data['category'], 'category')
+        if err:
+            return err
+        product.category = data['category']
+    if 'photo_url' in data:
+        err = _reject_non_string(data['photo_url'], 'photo_url')
+        if err:
+            return err
+        product.photo_url = data['photo_url']
 
     db.session.commit()
     return jsonify(product.to_dict()), 200
@@ -332,9 +433,19 @@ def create_user():
     if not all(key in data for key in ['username', 'password', 'email']):
         return jsonify({'error': 'Missing required fields'}), 400
 
-    username = (data.get('username') or '').strip()
-    password = data.get('password')
-    email = (data.get('email') or '').strip()
+    err = _reject_non_string(data['username'], 'username')
+    if err:
+        return err
+    err = _reject_non_string(data['password'], 'password')
+    if err:
+        return err
+    err = _reject_non_string(data['email'], 'email')
+    if err:
+        return err
+
+    username = data['username'].strip()
+    password = data['password']
+    email = data['email'].strip()
 
     if not username or not password or not email:
         return jsonify({'error': 'Missing required fields'}), 400
@@ -369,6 +480,8 @@ def add_to_cart():
 
     if 'product_id' not in data or 'quantity' not in data:
         return jsonify({'error': 'Missing required fields'}), 400
+    if not _is_valid_quantity(data['quantity']):
+        return jsonify({'error': 'Invalid quantity'}), 400
 
     product = db.session.get(Product, data['product_id'])
     if product is None:

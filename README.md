@@ -48,6 +48,10 @@ Exceeding a limit returns HTTP `429` with `{"error": "Too many requests"}`. Othe
 
 Every response includes `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`. Sensitive auth and JWT-protected responses also send `Cache-Control: no-store`. Public `GET /api/products` is left cacheable. JWT remains `Authorization: Bearer` (no cookies).
 
+### Request validation
+
+JSON field types are checked in the application before database writes. Cart `quantity` must be an integer from 1 to 1000. Product `price` must be a finite number `>= 0`. Expected string fields reject arrays, objects, numbers, booleans, and null. Request bodies larger than 256 KiB receive HTTP `413` with `{"error": "Request too large"}`.
+
 From `python/`:
 
 ```bash
