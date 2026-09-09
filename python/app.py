@@ -21,6 +21,7 @@ from database import db
 from models import User, Product, Cart, TokenBlocklist
 from settings import (
     flask_cors_kwargs,
+    is_development,
     normalize_rate_limit_username,
     resolve_cors_origins,
     resolve_jwt_secret,
@@ -133,6 +134,22 @@ def _reject_non_string_if_present(data, field):
     return _reject_non_string(data[field], field)
 
 
+def _username_or_email_taken(username, email):
+    """True if either identifier is already registered.
+
+    Always queries both fields so duplicate-username and duplicate-email
+    registration attempts are not distinguishable by short-circuit timing.
+    """
+    username_taken = User.query.filter_by(username=username).first() is not None
+    email_taken = User.query.filter_by(email=email).first() is not None
+    return username_taken or email_taken
+
+
+def _registration_conflict():
+    """Generic conflict for duplicate-account registration. Do not specify which field."""
+    return jsonify({'error': 'Registration failed'}), 400
+
+
 def _optional_string(data, field, default=''):
     if field not in data:
         return default, None
@@ -221,11 +238,8 @@ def register():
     if not username or not password or not email:
         return jsonify({'message': 'Username, email, and password are required'}), 400
 
-    if User.query.filter_by(username=username).first():
-        return jsonify({'message': 'Username already taken'}), 400
-
-    if User.query.filter_by(email=email).first():
-        return jsonify({'message': 'Email already exists'}), 400
+    if _username_or_email_taken(username, email):
+        return _registration_conflict()
 
     hashed_password = generate_password_hash(password)
     new_user = User(username=username, password=hashed_password, email=email)
@@ -235,7 +249,7 @@ def register():
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
-        return jsonify({'message': 'Username or email already exists'}), 400
+        return _registration_conflict()
 
     return jsonify({'message': 'User registered successfully'}), 201
 
@@ -450,11 +464,8 @@ def create_user():
     if not username or not password or not email:
         return jsonify({'error': 'Missing required fields'}), 400
 
-    if User.query.filter_by(username=username).first():
-        return jsonify({'error': 'Username already taken'}), 400
-
-    if User.query.filter_by(email=email).first():
-        return jsonify({'error': 'Email already exists'}), 400
+    if _username_or_email_taken(username, email):
+        return _registration_conflict()
 
     hashed_password = generate_password_hash(password)
     new_user = User(username=username, password=hashed_password, email=email)
@@ -464,7 +475,7 @@ def create_user():
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
-        return jsonify({'error': 'Username or email already exists'}), 400
+        return _registration_conflict()
 
     return jsonify({'message': 'User created successfully', 'user': new_user.to_dict()}), 201
 
@@ -524,7 +535,7 @@ def delete_cart_item(product_id):
     return jsonify({'message': 'Cart item deleted'}), 200
 
 if __name__ == '__main__':
-    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    debug = is_development() and os.environ.get('FLASK_DEBUG', '0') == '1'
     host = os.environ.get('FLASK_HOST', '127.0.0.1')
     port = int(os.environ.get('FLASK_PORT', '5000'))
     app.run(host=host, port=port, debug=debug)

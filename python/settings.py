@@ -15,13 +15,14 @@ _MIN_PRODUCTION_SECRET_LENGTH = 32
 
 
 def is_development(environ=None):
+    """True only for an explicit development environment.
+
+    JWT secret-length policy uses this. FLASK_DEBUG must not imply
+    development when FLASK_ENV is unset or non-development.
+    """
     env = environ if environ is not None else os.environ
     flask_env = (env.get('FLASK_ENV') or env.get('ENV') or '').strip().lower()
-    if flask_env in ('development', 'dev'):
-        return True
-    if flask_env in ('production', 'prod'):
-        return False
-    return env.get('FLASK_DEBUG', '0') == '1'
+    return flask_env in ('development', 'dev')
 
 
 def resolve_jwt_secret(environ=None):

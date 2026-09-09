@@ -63,8 +63,67 @@ def test_valid_production_secret_returned():
 
 def test_is_development_from_flask_env():
     assert is_development({'FLASK_ENV': 'development'}) is True
+    assert is_development({'FLASK_ENV': 'dev'}) is True
     assert is_development({'FLASK_ENV': 'production'}) is False
     assert is_development({}) is False
+
+
+def test_flask_debug_does_not_imply_development_for_jwt_policy():
+    assert is_development({'FLASK_DEBUG': '1'}) is False
+    assert is_development({'FLASK_ENV': '', 'FLASK_DEBUG': '1'}) is False
+    assert is_development({'FLASK_ENV': 'production', 'FLASK_DEBUG': '1'}) is False
+    assert is_development({'FLASK_ENV': 'prod', 'FLASK_DEBUG': '1'}) is False
+    assert is_development({'FLASK_ENV': 'staging', 'FLASK_DEBUG': '1'}) is False
+    assert is_development({'FLASK_ENV': 'development', 'FLASK_DEBUG': '0'}) is True
+    assert is_development({'FLASK_ENV': 'dev', 'FLASK_DEBUG': '1'}) is True
+
+
+def test_no_fallback_jwt_secret():
+    with pytest.raises(RuntimeError, match='JWT_SECRET_KEY environment variable is required'):
+        resolve_jwt_secret({'FLASK_ENV': 'development'})
+    with pytest.raises(RuntimeError, match='JWT_SECRET_KEY environment variable is required'):
+        resolve_jwt_secret({'FLASK_DEBUG': '1'})
+
+
+def test_short_secret_rejected_when_env_unset_even_if_flask_debug():
+    with pytest.raises(RuntimeError, match='at least 32 characters'):
+        resolve_jwt_secret({
+            'JWT_SECRET_KEY': 'short-dev-secret',
+            'FLASK_DEBUG': '1',
+        })
+
+
+def test_short_secret_rejected_in_production_even_if_flask_debug():
+    with pytest.raises(RuntimeError, match='at least 32 characters'):
+        resolve_jwt_secret({
+            'JWT_SECRET_KEY': 'short-dev-secret',
+            'FLASK_ENV': 'production',
+            'FLASK_DEBUG': '1',
+        })
+
+
+def test_short_secret_rejected_for_non_dev_env_even_if_flask_debug():
+    with pytest.raises(RuntimeError, match='at least 32 characters'):
+        resolve_jwt_secret({
+            'JWT_SECRET_KEY': 'short-dev-secret',
+            'FLASK_ENV': 'staging',
+            'FLASK_DEBUG': '1',
+        })
+
+
+def test_short_secret_allowed_in_dev_alias():
+    secret = resolve_jwt_secret({
+        'JWT_SECRET_KEY': 'short-dev-secret',
+        'FLASK_ENV': 'dev',
+        'FLASK_DEBUG': '1',
+    })
+    assert secret == 'short-dev-secret'
+
+
+def test_debugger_not_enabled_from_flask_debug_alone():
+    source = (BACKEND_DIR / 'app.py').read_text()
+    assert 'is_development() and os.environ.get(\'FLASK_DEBUG\', \'0\') == \'1\'' in source
+    assert "debug = os.environ.get('FLASK_DEBUG', '0') == '1'" not in source
 
 
 def test_app_source_does_not_hardcode_jwt_secret():
