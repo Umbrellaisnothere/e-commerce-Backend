@@ -1,61 +1,284 @@
+import math
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
-from flask_migrate import Migrate
-from flask_sqlalchemy import SQLAlchemy
-from models import db, Product, User, Cart
 from flask_cors import CORS
 from flask_jwt_extended import (
-    JWTManager, create_access_token, jwt_required, get_jwt_identity
+    JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt
 )
+from flask_limiter import Limiter
+from flask_limiter.errors import RateLimitExceeded
+from flask_limiter.util import get_remote_address
+from flask_migrate import Migrate
+from sqlalchemy.exc import IntegrityError
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import generate_password_hash, check_password_hash
-from models import db, User, Product, Cart
+
+from database import db
+from models import User, Product, Cart, TokenBlocklist
+from settings import (
+    flask_cors_kwargs,
+    is_development,
+    normalize_rate_limit_username,
+    resolve_cors_origins,
+    resolve_jwt_secret,
+)
+
+_backend_dir = Path(__file__).resolve().parent
+load_dotenv(_backend_dir / '.env')
+load_dotenv(_backend_dir.parent / '.env')
 
 app = Flask(__name__)
-CORS(app)
+jwt_secret = resolve_jwt_secret()
+CORS(app, **flask_cors_kwargs(resolve_cors_origins()))
 
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///../instance/products.db'
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri='memory://',
+    strategy='fixed-window',
+    swallow_errors=False,
+)
+
+LOGIN_RATE_LIMIT = '10 per minute'
+REGISTRATION_RATE_LIMIT = '5 per hour'
+MAX_CART_QUANTITY = 1000
+MAX_CONTENT_LENGTH = 256 * 1024
+_registration_ip_limit = limiter.shared_limit(
+    REGISTRATION_RATE_LIMIT,
+    scope='registration',
+    key_func=get_remote_address,
+)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
+    'DATABASE_URL',
+    'sqlite:///../instance/products.db'
+)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = '8369a00156590593b430006a34c9944cd2f07ecbdd1caa53d259853b03fffc2dd092aa1be3c7d782efbd88949d036e1af71dbd16aba51dd308df632fb82d0632fa6a35163077ec8e3f7db1321d9dad6de5cf29a73c490a74da6f1fd14579100dc8f1e05f5003d0339739e8e2780bdeb8391d5581545da4f96cac6903c188e248309f8b67ea0ead3dc076ac02aea0ca727bae0f453f60e00f1cbe1c4e13be7d959ab041a8fb4bc5ff5e0756e70dc25a2c5dbb0f03a7d1914424a6136b51e4956ed5b4c600e8c782ae7317a9ae04d42188c4372c9816c08ec3b7f547c20cf3217188ea79a830caaa9dae4acfb628b422cd6c3522feb1d9365a8529de768cc18082'
+app.config['JWT_SECRET_KEY'] = jwt_secret
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', jwt_secret)
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 db.init_app(app)
-migrate = Migrate(app, db)
+migrate = Migrate(
+    app,
+    db,
+    directory=os.path.join(_backend_dir, 'migrations'),
+    render_as_batch=True,
+)
 jwt = JWTManager(app)
+
+
+@jwt.token_in_blocklist_loader
+def token_is_revoked(jwt_header, jwt_payload):
+    jti = jwt_payload.get('jti')
+    if not jti:
+        return False
+    return (
+        db.session.query(TokenBlocklist.id).filter_by(jti=jti).first()
+        is not None
+    )
+
+
+def get_current_user_id():
+    """Return the authenticated user id as an int (JWT sub may be a string)."""
+    return int(get_jwt_identity())
+
+
+def _json_body():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _invalid_field(field):
+    return jsonify({'error': f'Invalid {field}'}), 400
+
+
+def _is_json_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_json_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_valid_quantity(value):
+    return _is_json_int(value) and 1 <= value <= MAX_CART_QUANTITY
+
+
+def _is_valid_price(value):
+    if not _is_json_number(value):
+        return False
+    if not math.isfinite(value):
+        return False
+    return value >= 0
+
+
+def _reject_non_string(value, field):
+    """Return a 400 response unless value is a JSON string."""
+    if not isinstance(value, str):
+        return _invalid_field(field)
+    return None
+
+
+def _reject_non_string_if_present(data, field):
+    """If the field is present, it must be a JSON string (null is invalid)."""
+    if field not in data:
+        return None
+    return _reject_non_string(data[field], field)
+
+
+def _username_or_email_taken(username, email):
+    """True if either identifier is already registered.
+
+    Always queries both fields so duplicate-username and duplicate-email
+    registration attempts are not distinguishable by short-circuit timing.
+    """
+    username_taken = User.query.filter_by(username=username).first() is not None
+    email_taken = User.query.filter_by(email=email).first() is not None
+    return username_taken or email_taken
+
+
+def _registration_conflict():
+    """Generic conflict for duplicate-account registration. Do not specify which field."""
+    return jsonify({'error': 'Registration failed'}), 400
+
+
+def _optional_string(data, field, default=''):
+    if field not in data:
+        return default, None
+    err = _reject_non_string(data[field], field)
+    if err:
+        return None, err
+    return data[field], None
+
+
+def login_username_key():
+    """Rate-limit key for login attempts. Never includes the password."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return normalize_rate_limit_username('')
+    return normalize_rate_limit_username(data.get('username'))
+
+
+@app.errorhandler(429)
+@app.errorhandler(RateLimitExceeded)
+def too_many_requests(exc):
+    return jsonify({'error': 'Too many requests'}), 429
+
+
+@app.errorhandler(413)
+@app.errorhandler(RequestEntityTooLarge)
+def request_too_large(exc):
+    return jsonify({'error': 'Request too large'}), 413
+
+
+# Unauthenticated endpoints that still return credentials or account data.
+# JWT-protected views are detected separately from @jwt_required().
+_UNAUTHENTICATED_NO_STORE_ENDPOINTS = frozenset({
+    'login',
+    'register',
+    'create_user',
+})
+
+
+def _endpoint_requires_jwt(endpoint):
+    """True if the matched view is wrapped with @jwt_required()."""
+    func = app.view_functions.get(endpoint)
+    seen = set()
+    while func is not None and id(func) not in seen:
+        seen.add(id(func))
+        names = getattr(getattr(func, '__code__', None), 'co_names', ())
+        if 'verify_jwt_in_request' in names:
+            return True
+        func = getattr(func, '__wrapped__', None)
+    return False
+
+
+def _should_disable_store(req):
+    """Explicit no-store policy for auth and JWT-protected responses."""
+    endpoint = req.endpoint
+    if endpoint in _UNAUTHENTICATED_NO_STORE_ENDPOINTS:
+        return True
+    return _endpoint_requires_jwt(endpoint)
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    if _should_disable_store(request):
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
 
 # User Registration
 @app.route('/register', methods=['POST'])
+@_registration_ip_limit
 def register():
-    data = request.get_json()
-    username = data.get('username')
+    data = _json_body()
+    if not data:
+        return jsonify({'message': 'Request body must be JSON'}), 400
+
+    for field in ('username', 'password', 'email'):
+        err = _reject_non_string_if_present(data, field)
+        if err:
+            return err
+
+    username = (data.get('username') or '').strip()
     password = data.get('password')
-    email = data.get('email')
+    email = (data.get('email') or '').strip()
 
-    if User.query.filter_by(username=username).first():
-        return jsonify({'message': 'Username already taken'}), 400
+    if not username or not password or not email:
+        return jsonify({'message': 'Username, email, and password are required'}), 400
 
-    if User.query.filter_by(email=email).first():
-        return jsonify({'message': 'Email already exists'}), 400
+    if _username_or_email_taken(username, email):
+        return _registration_conflict()
 
     hashed_password = generate_password_hash(password)
     new_user = User(username=username, password=hashed_password, email=email)
 
     db.session.add(new_user)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return _registration_conflict()
 
     return jsonify({'message': 'User registered successfully'}), 201
 
 
 # User Login
 @app.route('/login', methods=['POST'])
+@limiter.limit(LOGIN_RATE_LIMIT, key_func=get_remote_address)
+@limiter.limit(LOGIN_RATE_LIMIT, key_func=login_username_key)
 def login():
-    data = request.get_json()
+    data = _json_body()
+    if not data:
+        return jsonify({'message': 'Request body must be JSON'}), 400
+
     username = data.get('username')
     password = data.get('password')
+    for field in ('username', 'password'):
+        err = _reject_non_string_if_present(data, field)
+        if err:
+            return err
+
+    if not username or not password:
+        return jsonify({'message': 'Invalid credentials'}), 401
 
     user = User.query.filter_by(username=username).first()
 
     if not user or not check_password_hash(user.password, password):
         return jsonify({'message': 'Invalid credentials'}), 401
 
-    access_token = create_access_token(identity=user.user_id)
+    access_token = create_access_token(identity=str(user.user_id))
     return jsonify({
         'access_token': access_token,
         'user': {
@@ -63,14 +286,36 @@ def login():
             'email': user.email
         }
     }), 200
-    
+
+
+@app.route('/logout', methods=['POST'])
+@jwt_required()
+def logout():
+    claims = get_jwt()
+    jti = claims['jti']
+    exp = claims['exp']
+    if TokenBlocklist.query.filter_by(jti=jti).first() is None:
+        revoked_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        expires_at = datetime.fromtimestamp(exp, tz=timezone.utc).replace(tzinfo=None)
+        db.session.add(TokenBlocklist(
+            jti=jti,
+            revoked_at=revoked_at,
+            expires_at=expires_at,
+        ))
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+    return jsonify({'message': 'Logged out'}), 200
+
 
 # Protected Route Example
 @app.route('/', methods=['GET'])
 @jwt_required()
 def protected():
-    current_user_id = get_jwt_identity()
-    user = User.query.get(current_user_id)
+    user = db.session.get(User, get_current_user_id())
+    if user is None:
+        return jsonify({'message': 'User not found'}), 401
     return jsonify({'message': f'Hello {user.username}, this is a protected route!'}), 200
 
 
@@ -81,7 +326,7 @@ def home():
 @app.route('/api/user/products', methods=['GET'])
 @jwt_required()
 def get_user_products():
-    user_id = get_jwt_identity()
+    user_id = get_current_user_id()
     products = Product.query.filter_by(user_id=user_id).all()
     return jsonify([product.to_dict() for product in products]), 200
  # GET all products (public)
@@ -94,19 +339,36 @@ def get_products():
 @app.route('/api/products', methods=['POST'])
 @jwt_required()
 def create_product():
-    user_id = get_jwt_identity()
-    data = request.get_json()
+    user_id = get_current_user_id()
+    data = _json_body()
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
 
     if not all(key in data for key in ['name', 'price', 'category']):
         return jsonify({'error': 'Missing required fields'}), 400
+
+    err = _reject_non_string(data['name'], 'name')
+    if err:
+        return err
+    err = _reject_non_string(data['category'], 'category')
+    if err:
+        return err
+    description, err = _optional_string(data, 'description')
+    if err:
+        return err
+    photo_url, err = _optional_string(data, 'photo_url')
+    if err:
+        return err
+    if not _is_valid_price(data['price']):
+        return jsonify({'error': 'Invalid price'}), 400
 
     new_product = Product(
         user_id=user_id,
         name=data['name'],
         price=data['price'],
         category=data['category'],
-        description=data.get('description', ''),
-        photo_url=data.get('photo_url', '')
+        description=description,
+        photo_url=photo_url,
     )
     db.session.add(new_product)
     db.session.commit()
@@ -117,18 +379,42 @@ def create_product():
 @app.route('/api/products/<int:product_id>', methods=['PUT'])
 @jwt_required()
 def update_product(product_id):
-    user_id = get_jwt_identity()
-    product = Product.query.get_or_404(product_id)
+    user_id = get_current_user_id()
+    product = db.session.get(Product, product_id)
+    if product is None:
+        return jsonify({'error': 'Product not found'}), 404
 
     if product.user_id != user_id:
         return jsonify({'error': 'Unauthorized access'}), 403
 
-    data = request.get_json()
-    product.name = data.get('name', product.name)
-    product.price = data.get('price', product.price)
-    product.description = data.get('description', product.description)
-    product.category = data.get('category', product.category)
-    product.photo_url = data.get('photo_url', product.photo_url)
+    data = _json_body()
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
+
+    if 'name' in data:
+        err = _reject_non_string(data['name'], 'name')
+        if err:
+            return err
+        product.name = data['name']
+    if 'description' in data:
+        err = _reject_non_string(data['description'], 'description')
+        if err:
+            return err
+        product.description = data['description']
+    if 'price' in data:
+        if not _is_valid_price(data['price']):
+            return jsonify({'error': 'Invalid price'}), 400
+        product.price = data['price']
+    if 'category' in data:
+        err = _reject_non_string(data['category'], 'category')
+        if err:
+            return err
+        product.category = data['category']
+    if 'photo_url' in data:
+        err = _reject_non_string(data['photo_url'], 'photo_url')
+        if err:
+            return err
+        product.photo_url = data['photo_url']
 
     db.session.commit()
     return jsonify(product.to_dict()), 200
@@ -137,8 +423,10 @@ def update_product(product_id):
 @app.route('/api/products/<int:product_id>', methods=['DELETE'])
 @jwt_required()
 def delete_product(product_id):
-    user_id = get_jwt_identity()
-    product = Product.query.get_or_404(product_id)
+    user_id = get_current_user_id()
+    product = db.session.get(Product, product_id)
+    if product is None:
+        return jsonify({'error': 'Product not found'}), 404
 
     if product.user_id != user_id:
         return jsonify({'error': 'Unauthorized access'}), 403
@@ -146,29 +434,48 @@ def delete_product(product_id):
     db.session.delete(product)
     db.session.commit()
     return jsonify({'message': 'Product deleted'}), 200
-# GET all users (public)
-@app.route('/api/users', methods=['GET'])
-def get_users():
-    users = User.query.all()
-    return jsonify([user.to_dict() for user in users]), 200
 
 
 # POST create a new user (registration)
 @app.route('/api/users', methods=['POST'])
+@_registration_ip_limit
 def create_user():
-    data = request.get_json()
+    data = _json_body()
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
 
     if not all(key in data for key in ['username', 'password', 'email']):
         return jsonify({'error': 'Missing required fields'}), 400
 
-    if User.query.filter_by(email=data['email']).first():
-        return jsonify({'error': 'Email already exists'}), 400
+    err = _reject_non_string(data['username'], 'username')
+    if err:
+        return err
+    err = _reject_non_string(data['password'], 'password')
+    if err:
+        return err
+    err = _reject_non_string(data['email'], 'email')
+    if err:
+        return err
 
-    hashed_password = generate_password_hash(data['password'])
-    new_user = User(username=data['username'], password=hashed_password, email=data['email'])
+    username = data['username'].strip()
+    password = data['password']
+    email = data['email'].strip()
+
+    if not username or not password or not email:
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    if _username_or_email_taken(username, email):
+        return _registration_conflict()
+
+    hashed_password = generate_password_hash(password)
+    new_user = User(username=username, password=hashed_password, email=email)
 
     db.session.add(new_user)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return _registration_conflict()
 
     return jsonify({'message': 'User created successfully', 'user': new_user.to_dict()}), 201
 
@@ -177,13 +484,19 @@ def create_user():
 @app.route('/api/cart', methods=['POST'])
 @jwt_required()
 def add_to_cart():
-    user_id = get_jwt_identity()
-    data = request.get_json()
+    user_id = get_current_user_id()
+    data = _json_body()
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
 
     if 'product_id' not in data or 'quantity' not in data:
         return jsonify({'error': 'Missing required fields'}), 400
+    if not _is_valid_quantity(data['quantity']):
+        return jsonify({'error': 'Invalid quantity'}), 400
 
-    product = Product.query.get_or_404(data['product_id'])
+    product = db.session.get(Product, data['product_id'])
+    if product is None:
+        return jsonify({'error': 'Product not found'}), 404
 
     cart_item = Cart.query.filter_by(user_id=user_id, product_id=product.product_id).first()
     if cart_item:
@@ -200,7 +513,7 @@ def add_to_cart():
 @app.route('/api/cart', methods=['GET'])
 @jwt_required()
 def view_cart():
-    user_id = get_jwt_identity()
+    user_id = get_current_user_id()
     cart_items = Cart.query.filter_by(user_id=user_id).all()
     return jsonify([{
         'product_id': item.product_id,
@@ -212,12 +525,17 @@ def view_cart():
 @app.route('/api/cart/<int:product_id>', methods=['DELETE'])
 @jwt_required()
 def delete_cart_item(product_id):
-    user_id = get_jwt_identity()
-    cart_item = Cart.query.filter_by(user_id=user_id, product_id=product_id).first_or_404()
+    user_id = get_current_user_id()
+    cart_item = Cart.query.filter_by(user_id=user_id, product_id=product_id).first()
+    if cart_item is None:
+        return jsonify({'error': 'Cart item not found'}), 404
 
     db.session.delete(cart_item)
     db.session.commit()
     return jsonify({'message': 'Cart item deleted'}), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    debug = is_development() and os.environ.get('FLASK_DEBUG', '0') == '1'
+    host = os.environ.get('FLASK_HOST', '127.0.0.1')
+    port = int(os.environ.get('FLASK_PORT', '5000'))
+    app.run(host=host, port=port, debug=debug)

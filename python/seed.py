@@ -1,22 +1,114 @@
-from app import app
-from models import db, User, Product
+import os
+import secrets
 
-with app.app_context():
-    db.drop_all()
-    db.create_all()
-    
-    if not User.query.filter_by(email='angel@example.com').first():
-        user1 = User(username='Angel', password='angel', email='angel@example.com')
-        db.session.add(user1)
+from werkzeug.security import generate_password_hash
 
-    if not User.query.filter_by(email='mitchelle@example.com').first():
-        user2 = User(username='Mitchelle', password='mitchelle', email='mitchelle@example.com')
-        db.session.add(user2)
+# Demo identities are preserved. Passwords are never stored in this file.
+ANGEL_USERNAME = 'Angel'
+ANGEL_EMAIL = 'angel@example.com'
+ANGEL_PASSWORD_ENV = 'SEED_PASSWORD_ANGEL'
 
-    db.session.commit()
-    
-    user1 = User.query.filter_by(email='angel@example.com').first()
-    user2 = User.query.filter_by(email='mitchelle@example.com').first()
+MITCHELLE_USERNAME = 'Mitchelle'
+MITCHELLE_EMAIL = 'mitchelle@example.com'
+MITCHELLE_PASSWORD_ENV = 'SEED_PASSWORD_MITCHELLE'
+
+
+class SeedRefused(RuntimeError):
+    """Raised when seeding is not allowed in this environment."""
+
+
+def assert_seed_allowed(environ=None):
+    """Fail closed unless FLASK_ENV is development.
+
+    Production/prod is always refused. Unset FLASK_ENV is refused.
+    SEED_ALLOW=1 cannot bypass those protections.
+    """
+    env = environ if environ is not None else os.environ
+    flask_env = (env.get('FLASK_ENV') or env.get('ENV') or '').strip().lower()
+    seed_allow = (env.get('SEED_ALLOW') or '').strip().lower() in ('1', 'true', 'yes')
+
+    if flask_env in ('production', 'prod'):
+        raise SeedRefused(
+            'Refusing to seed: FLASK_ENV is production. '
+            'Seed is a local development operation only.'
+            + (' SEED_ALLOW cannot override production.' if seed_allow else '')
+        )
+
+    if flask_env not in ('development', 'dev'):
+        raise SeedRefused(
+            'Refusing to seed: set FLASK_ENV=development to run the seed script. '
+            'Unset FLASK_ENV is treated as non-development (fail closed).'
+            + (' SEED_ALLOW cannot override this.' if seed_allow else '')
+        )
+
+
+def resolve_seed_password(env_var, environ=None):
+    """Return (password, generated). Never uses a hardcoded default password."""
+    env = environ if environ is not None else os.environ
+    supplied = (env.get(env_var) or '').strip()
+    if supplied:
+        return supplied, False
+    return secrets.token_urlsafe(16), True
+
+
+def hash_seed_password(password):
+    """Hash with the same Werkzeug helper the app uses (scrypt by default)."""
+    return generate_password_hash(password)
+
+
+def _create_demo_user_if_missing(username, email, password_env, environ):
+    from models import User, db
+
+    existing = User.query.filter_by(email=email).first()
+    if existing:
+        print(f'Demo user {username} <{email}> already exists; password unchanged.')
+        return existing
+
+    plain, generated = resolve_seed_password(password_env, environ)
+    user = User(
+        username=username,
+        password=hash_seed_password(plain),
+        email=email,
+    )
+    db.session.add(user)
+    db.session.flush()
+
+    if generated:
+        print(f'Generated development password for {username} ({email}): {plain}')
+        print('Store this now; it will not be shown again.')
+    else:
+        print(f'Created development user {username} ({email}) using {password_env}.')
+    return user
+
+
+def run_seed(environ=None):
+    env = environ if environ is not None else os.environ
+    assert_seed_allowed(env)
+
+    from app import app
+    from models import db, Product
+
+    with app.app_context():
+        db.create_all()
+
+        user1 = _create_demo_user_if_missing(
+            ANGEL_USERNAME, ANGEL_EMAIL, ANGEL_PASSWORD_ENV, env
+        )
+        user2 = _create_demo_user_if_missing(
+            MITCHELLE_USERNAME, MITCHELLE_EMAIL, MITCHELLE_PASSWORD_ENV, env
+        )
+        db.session.commit()
+
+        if Product.query.count() > 0:
+            print('Database already has products; skipping product seed.')
+        else:
+            _seed_product_catalog(user1, user2)
+
+        print('Database seeded successfully.')
+
+
+def _seed_product_catalog(user1, user2):
+    from models import db, Product
 
     product1 = Product(
         user_id=user1.user_id,
@@ -148,5 +240,7 @@ with app.app_context():
     )
     db.session.add_all([product1, product2, product3, product4, product5, product6,product7, product8, product9, product10, product11, product12, product13, product14, product15, product16])
     db.session.commit()
-    
-    print("Database seeded successfully.")
+
+
+if __name__ == '__main__':
+    run_seed()
